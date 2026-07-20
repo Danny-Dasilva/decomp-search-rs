@@ -78,6 +78,41 @@ prints plain flushed lines when redirected.
 Project names in the index: melee, mp4, pikmin2 — reuse these exact names
 on re-ingest or you'll create a duplicate project.
 
+## Type-layout index (redundant structs / casts / union views)
+
+Separate structural index (`dsearch/typeidx.py`, stdlib-only JSON at
+`data/types-<project>.json`) — no embeddings, no LanceDB. Input is a clang
+PPC-EABI record-layout dump of the project's m2ctx context (matches MWCC
+`-align powerpc`); every record flattens to normalized layout leaves
+(offset, i8/i16/i32/i64/f32/f64/ptr/bf) ignoring names and signedness.
+
+```sh
+# melee: regenerate build/ctx.c first when headers changed
+#   (in melee: .venv/bin/python tools/m2ctx/m2ctx.py -p > build/ctx.c)
+.venv/bin/python -m dsearch.cli types-ingest ~/etc/melee --project melee
+
+types-dups   --project melee [--prefix]   # identical-layout records;
+                                          # --prefix = truncated decodes
+types-near   RECORD --project melee       # rank by layout similarity
+types-unions RECORD --project melee       # redundant union member views
+types-unions GroundVars --project melee --at 0x4  # every field aliasing
+                                          # a byte (gv xC8 spellings live
+                                          # at gv+0x4, not +0xC8)
+types-casts  ~/etc/melee --project melee --views-only
+             # record-pointer cast sites; flags CAST-ONLY, pad>=50%
+             # (overlay views a la grCn_ArwingDataView), layout dups
+```
+
+Validated day 1: gv+0x4 lists starfox.arwing_slot / corneria2.xC8 /
+venom.xC8 (the PR-2917 spelling family); casts flags Soundtest_GObj as a
+redundant HSD_GObj decode, mn_80231634_t (pad=80%) and the toy.c overlays;
+dups finds Article == it_804D6D20_t, _ftECB == lbColl_8000A10C_arg0_t;
+prefix finds HitCapsule c= ItemHitbox, plAttackStats c= plActionStats.
+Caveats: layout equality is a candidate signal, not proof two types are
+the same semantic object — verify against target asm before merging;
+the index is only as fresh as ctx.c; anonymous records join back to their
+typedef alias via ctx line numbers, so keep the ctx un-reformatted.
+
 ## Maintain the eval
 
 When you find a true twin pair manually, add it to `eval/known_pairs.json`,

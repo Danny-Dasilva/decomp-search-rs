@@ -3,6 +3,7 @@
   ingest-dtk  ROOT --project NAME [--version GALE01] [--report PATH|URL]
               [--backend hashed|local|voyage]
   find        FN [--project P] [--min-match 99.5] [-k 15] [--all] [--backend B]
+  search      TEXT [--project P] [--min-match 99.5] [-k 15] [--all]
   stats       [--backend B]
   eval        [--pairs eval/known_pairs.json] [--backend B]
 """
@@ -21,7 +22,7 @@ from rich.progress import (BarColumn, MofNCompleteColumn, Progress,
 from rich.table import Table
 
 from . import db as dbmod
-from .embed import default_backend, dim_for, embed
+from .embed import default_backend, dim_for, embed, embed_query
 from .ingest_dtk import (find_objdump, find_source_file, iter_units,
                          load_report, parse_object)
 from .normalize import token_text, window_texts
@@ -219,6 +220,22 @@ def cmd_find(args) -> None:
                 f"match {row['match_pct']:.2f})", hits)
 
 
+def cmd_search(args) -> None:
+    table = _open(args)
+    text = " ".join(args.text)
+    vector = embed_query(text, args.backend)
+    where = []
+    if not args.all:
+        where.append(f"match_pct >= {args.min_match}")
+    if args.project:
+        project = args.project.replace("'", "''")
+        where.append(f"project = '{project}'")
+    hits = (table.search(vector).metric("cosine")
+            .where(" AND ".join(where) if where else None, prefilter=True)
+            .limit(args.k).to_list())
+    _print_hits(text, hits)
+
+
 def _wstart(row_id: str) -> int:
     return int(row_id.rsplit(":w", 1)[1])
 
@@ -306,6 +323,88 @@ def cmd_eval(args) -> None:
     console.print(f"{ok}/{len(pairs)} recovered in top {args.k}")
 
 
+def _disp(idx: dict, name: str) -> str:
+    from . import typeidx
+    return typeidx.display_name(idx, name)
+
+
+def cmd_types_ingest(args) -> None:
+    from . import typeidx
+    ctx = Path(args.ctx) if args.ctx else Path(args.root) / "build" / "ctx.c"
+    if not ctx.exists():
+        raise SystemExit(f"{ctx} not found — generate it with m2ctx "
+                         f"(melee: .venv/bin/python tools/m2ctx/m2ctx.py -p)")
+    idx = typeidx.ingest(args.project, ctx, clang=args.clang)
+    n = len(idx["records"])
+    console.print(f"[green]{args.project}: {n} records indexed from "
+                  f"{ctx}[/green] -> {typeidx.index_path(args.project)}")
+
+
+def cmd_types_dups(args) -> None:
+    from . import typeidx
+    idx = typeidx.load(args.project)
+    groups = typeidx.dup_groups(idx, min_leaves=args.min_leaves)
+    for g in groups:
+        r = idx["records"][g[0]]
+        console.print(f"[bold]sizeof={r['size']}[/bold] "
+                      f"({len(r['leaves'])} leaves): "
+                      + ", ".join(_disp(idx, n) for n in g))
+    console.print(f"{len(groups)} identical-layout groups")
+    if args.prefix:
+        pairs = typeidx.prefix_pairs(idx, min_leaves=args.min_leaves + 1)
+        for a, b in pairs[:args.k]:
+            ra, rb = idx["records"][a], idx["records"][b]
+            console.print(f"prefix: {_disp(idx, a)} ({ra['size']}B) ⊂ "
+                          f"{_disp(idx, b)} ({rb['size']}B)")
+
+
+def cmd_types_near(args) -> None:
+    from . import typeidx
+    idx = typeidx.load(args.project)
+    for ratio, n in typeidx.near(idx, args.record, k=args.k):
+        r = idx["records"][n]
+        console.print(f"{ratio:6.3f}  {_disp(idx, n)}  "
+                      f"sizeof={r['size']} leaves={len(r['leaves'])}")
+
+
+def cmd_types_unions(args) -> None:
+    from . import typeidx
+    idx = typeidx.load(args.project)
+    if args.at is not None:
+        off = int(args.at, 0)
+        for path, start in typeidx.members_at(idx, args.record, off):
+            print(f"  +0x{start:X}  {path}")
+        return
+    for g in typeidx.union_views(idx, args.record):
+        print("identical member views: " + ", ".join(g))
+
+
+def cmd_types_casts(args) -> None:
+    from . import typeidx
+    idx = typeidx.load(args.project)
+    rows = typeidx.scan_casts(idx, Path(args.root) / "src")
+    for row in rows:
+        if len(row["sites"]) < args.min_sites:
+            continue
+        flags = []
+        if row["non_cast_uses"] <= args.view_uses:
+            flags.append("CAST-ONLY")
+        if row["pad_frac"] >= 0.5:
+            flags.append(f"pad={row['pad_frac']:.0%}")
+        if row["layout_dups"]:
+            flags.append("dup-of: " + ", ".join(
+                _disp(idx, d) for d in row["layout_dups"][:3]))
+        if args.views_only and not flags:
+            continue
+        console.print(f"[bold]{row['type']}[/bold] sizeof={row['size']} "
+                      f"{len(row['sites'])} cast sites, "
+                      f"{row['non_cast_uses']} other uses"
+                      + (("  [red]" + " ".join(flags) + "[/red]")
+                         if flags else ""))
+        for s in row["sites"][:args.show_sites]:
+            console.print(f"    {s}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="dsearch")
     p.add_argument("--db", default=str(dbmod.DEFAULT_DB))
@@ -346,6 +445,15 @@ def main() -> None:
     pf.add_argument("--exclude-self-unit", action="store_true")
     pf.set_defaults(func=cmd_find)
 
+    pq = sub.add_parser("search", help="search functions using arbitrary text")
+    pq.add_argument("text", nargs="+")
+    pq.add_argument("--project")
+    pq.add_argument("--min-match", type=float, default=99.5)
+    pq.add_argument("--all", action="store_true",
+                    help="no match%% filter (include unmatched functions)")
+    pq.add_argument("-k", type=int, default=15)
+    pq.set_defaults(func=cmd_search)
+
     ps = sub.add_parser("stats")
     ps.set_defaults(func=cmd_stats)
 
@@ -354,6 +462,50 @@ def main() -> None:
                                            / "eval" / "known_pairs.json"))
     pe.add_argument("-k", type=int, default=20)
     pe.set_defaults(func=cmd_eval)
+
+    pti = sub.add_parser("types-ingest", help="index record layouts from a "
+                         "project's m2ctx context via clang PPC-EABI dump")
+    pti.add_argument("root")
+    pti.add_argument("--project", required=True)
+    pti.add_argument("--ctx", help="context file (default ROOT/build/ctx.c)")
+    pti.add_argument("--clang", default="clang")
+    pti.set_defaults(func=cmd_types_ingest)
+
+    ptd = sub.add_parser("types-dups", help="records with identical "
+                                            "normalized layouts")
+    ptd.add_argument("--project", required=True)
+    ptd.add_argument("--min-leaves", type=int, default=3)
+    ptd.add_argument("--prefix", action="store_true",
+                     help="also report truncated-decode prefix pairs")
+    ptd.add_argument("-k", type=int, default=30)
+    ptd.set_defaults(func=cmd_types_dups)
+
+    ptn = sub.add_parser("types-near", help="rank records by layout "
+                                            "similarity to RECORD")
+    ptn.add_argument("record")
+    ptn.add_argument("--project", required=True)
+    ptn.add_argument("-k", type=int, default=15)
+    ptn.set_defaults(func=cmd_types_near)
+
+    ptu = sub.add_parser("types-unions", help="redundant union member views;"
+                         " --at OFF lists every field aliasing a byte")
+    ptu.add_argument("record")
+    ptu.add_argument("--project", required=True)
+    ptu.add_argument("--at", help="byte offset (accepts 0x..)")
+    ptu.set_defaults(func=cmd_types_unions)
+
+    ptc = sub.add_parser("types-casts", help="scan ROOT/src for record-"
+                         "pointer casts; flag overlay-view types")
+    ptc.add_argument("root")
+    ptc.add_argument("--project", required=True)
+    ptc.add_argument("--min-sites", type=int, default=1)
+    ptc.add_argument("--view-uses", type=int, default=2,
+                     help="max non-cast uses to still count as CAST-ONLY "
+                          "(the definition itself accounts for ~2)")
+    ptc.add_argument("--show-sites", type=int, default=4)
+    ptc.add_argument("--views-only", action="store_true",
+                     help="only print flagged (suspicious) types")
+    ptc.set_defaults(func=cmd_types_casts)
 
     args = p.parse_args()
     args.func(args)
