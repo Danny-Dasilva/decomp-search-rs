@@ -5,42 +5,58 @@ description: Local similarity search over decomp-project functions — find matc
 
 # decomp-search
 
-Repo: `~/etc/decomp-search` (own venv). Run everything from that dir:
+Rust binary, mmap'd flat index, exact brute-force cosine. Every query is
+fast enough to call freely in a loop: `find` ~10ms, `findw` ~30-90ms,
+`donors` ~50ms — full process cost, no server needed.
+
+Build once: `cargo build --release` in `rust/` (or `cargo install --path rust`).
+Binary: `rust/target/release/dsearch`. Index dir: `data/dsi/*.dsi`
+(`--index-dir` or `DSEARCH_INDEX_DIR`). Backend: `--backend hashed|local`
+(default `local`; `DSEARCH_BACKEND` overrides).
+
+## One-call donor lookup (preferred for agents)
 
 ```sh
-.venv/bin/python -m dsearch.cli [--backend hashed|local|voyage] <cmd> ...
+dsearch --backend local donors <fn> --project melee -k 10 --wk 6
 ```
+
+JSON only. Returns whole-function twins (`twins`, local backend) AND
+construct/window twins (`windows`, hashed backend via `--wbackend`) in one
+call, with the min-match fallback ladder (99.5 -> 99 -> 95 -> 90) built in —
+`min_match_used` in `query` tells you if it relaxed. Every hit carries
+`name, unit, src_path, match_pct, n_insns, sim, same_unit` (+ `q_at`/`t_at`
+window insn offsets). `same_unit: true` hits are the highest-yield donors.
 
 ## Core query — matched donors for a function
 
 ```sh
-.venv/bin/python -m dsearch.cli find <fn> --min-match 99.5 --exclude-self-unit -k 10
+dsearch find <fn> --min-match 99.5 --exclude-self-unit -k 10 [--json] [--ladder]
 ```
 
 - `--all` = no match% filter (see the whole neighborhood)
+- `--ladder` = on zero hits, auto-relax min-match down 99/95/90
 - Drop `--exclude-self-unit` to include same-TU siblings
-- Default backend is `local` (self-hosted voyage-4-nano, semantic;
-  DSEARCH_BACKEND env overrides). `--backend hashed` = deterministic
-  n-grams — check both when it matters. `find` never runs the model at
-  query time; it uses the function's stored vector, so a backend only
-  works for projects ingested with it (check `stats`).
+- `find` never runs a model at query time — it searches with the function's
+  stored vector, so a backend only covers projects ingested with it
+  (check `stats`).
+- Plain output is aligned text (never truncated); `--json` gives the
+  machine schema (same shape as the old `dsearch.jsonq`).
 
 ## Construct-level query — window twins
 
 A loop/construct buried inside a larger matched function won't surface in
 `find` (whole-function vectors). `findw` searches every 32-insn sliding
-window of the query fn against all indexed windows and aggregates the best
-hit per candidate function (`q@`/`t@` columns = window insn offsets):
+window of the query fn against all indexed windows in ONE batched scan and
+aggregates the best hit per candidate function (`q@`/`t@` = window insn
+offsets):
 
 ```sh
-.venv/bin/python -m dsearch.cli --backend hashed findw <fn> --min-match 99.5 -k 10
+dsearch --backend hashed findw <fn> --min-match 99.5 -k 10 [--json] [--ladder]
 ```
 
 Validated: found lbHeap_80015900 -> MakeColorGenTExp (2x-unroll construct
-at t@416) which whole-function search misses. Windows are hashed-backend
-only so far. For exact instruction-pattern hunts, targeted scans
-(`melee/build/twinscan_*.py`: objdump all target .o's, regex, rank by
-match%) remain the sharpest tool — findw for recall, twinscan for proof.
+at t@416) which whole-function search misses. findw for recall, twinscan
+(`melee/build/twinscan_*.py`) for proof.
 
 ## Donor transplant (the highest-yield workflow)
 
@@ -49,82 +65,63 @@ objdump BOTH and compare: if the instruction streams are identical modulo
 displacements/trip counts, transplant the donor's SOURCE STRUCTURE wholesale
 (wrapper+inline split, accessor macros, alias pairs, decl order, PAD values)
 instead of tuning the current code. Validated: fn_802523D8 (mninfo) hit 100%
-in one step from the mncount donor fn_802514D8 (sim 0.991) after residual
-tuning had plateaued at 97.6%.
+in one step from the mncount donor fn_802514D8 (sim 0.991).
 
 ## Picking solve targets
 
-`solvability_sweep.py` ranks every sub-95% function by its best matched
-cross-unit neighbor — top entries are "probably solvable by donor". This
-found un_80300AF4 (74%->match, melee PR: extern-decl/define-at-bottom
-hoist fix).
+```sh
+dsearch --backend local sweep --project melee --min-sim 0.85 > solvable.json
+```
+
+Ranks every sub-100% function by its best matched neighbor (same JSON as the
+old nightly `jsonq sweep`, but runs in seconds — re-sweep on demand instead
+of waiting for the cron).
 
 ## Ingest a project (dtk-based)
 
-Needs target objects (`build/<VER>/obj/**/*.o` — dtk split runs natively on
-macOS, no wine) + a decomp.dev report:
+Needs target objects (`build/<VER>/obj/**/*.o`) + a decomp.dev report:
 
 ```sh
-.venv/bin/python -m dsearch.cli --backend hashed ingest-dtk <repo_root> \
+dsearch --backend hashed ingest-dtk <repo_root> \
     --project <name> --version <VER> --windows \
     --report 'https://decomp.dev/<org>/<repo>/<VER>.json?mode=report'
 ```
 
-Ingest is incremental (token-text diff): re-runs only embed new/changed
-functions; every embedding batch persists immediately, so interrupt/resume
-is safe (rerun continues). `--full` forces a re-embed. `--windows` also
-builds the construct-level index. One table per backend+kind. Progress
-prints plain flushed lines when redirected.
+Sub-second for a full project (hashed). Incremental: unchanged token docs
+reuse their stored vectors, so re-ingest after a build is instant and
+metadata-only changes (match% moves) never re-embed. For the `local`
+(voyage-4-nano) backend, new/changed docs are embedded via the Python
+helper: add `--py <python-with-dsearch-pkg>` (or `DSEARCH_PY`); everything
+else stays native. Migrating an existing LanceDB index instead:
+`tools/export_index.py` + `dsearch build-index`.
+
 Project names in the index: melee, mp4, pikmin2 — reuse these exact names
 on re-ingest or you'll create a duplicate project.
 
 ## Type-layout index (redundant structs / casts / union views)
 
-Separate structural index (`dsearch/typeidx.py`, stdlib-only JSON at
-`data/types-<project>.json`) — no embeddings, no LanceDB. Input is a clang
-PPC-EABI record-layout dump of the project's m2ctx context (matches MWCC
-`-align powerpc`); every record flattens to normalized layout leaves
-(offset, i8/i16/i32/i64/f32/f64/ptr/bf) ignoring names and signedness.
+Still the Python subsystem (`dsearch/typeidx.py`, stdlib-only JSON at
+`data/types-<project>.json`) — no embeddings, unchanged interface:
 
 ```sh
-# melee: regenerate build/ctx.c first when headers changed
-#   (in melee: .venv/bin/python tools/m2ctx/m2ctx.py -p > build/ctx.c)
 .venv/bin/python -m dsearch.cli types-ingest ~/etc/melee --project melee
-
-types-dups   --project melee [--prefix]   # identical-layout records;
-                                          # --prefix = truncated decodes
-types-near   RECORD --project melee       # rank by layout similarity
-types-unions RECORD --project melee       # redundant union member views
-types-unions GroundVars --project melee --at 0x4  # every field aliasing
-                                          # a byte (gv xC8 spellings live
-                                          # at gv+0x4, not +0xC8)
-types-casts  ~/etc/melee --project melee --views-only
-             # record-pointer cast sites; flags CAST-ONLY, pad>=50%
-             # (overlay views a la grCn_ArwingDataView), layout dups
+# types-dups / types-near / types-unions / types-casts as before
 ```
-
-Validated day 1: gv+0x4 lists starfox.arwing_slot / corneria2.xC8 /
-venom.xC8 (the PR-2917 spelling family); casts flags Soundtest_GObj as a
-redundant HSD_GObj decode, mn_80231634_t (pad=80%) and the toy.c overlays;
-dups finds Article == it_804D6D20_t, _ftECB == lbColl_8000A10C_arg0_t;
-prefix finds HitCapsule c= ItemHitbox, plAttackStats c= plActionStats.
-Caveats: layout equality is a candidate signal, not proof two types are
-the same semantic object — verify against target asm before merging;
-the index is only as fresh as ctx.c; anonymous records join back to their
-typedef alias via ctx line numbers, so keep the ctx un-reformatted.
 
 ## Maintain the eval
 
 When you find a true twin pair manually, add it to `eval/known_pairs.json`,
-then check recall: `.venv/bin/python -m dsearch.cli eval`.
+then check recall: `dsearch --backend local eval` (7/8 baseline; the miss is
+the documented findw-only construct case).
 
 ## Gotchas
 
-- venv scripts (pip) have stale shebangs after any repo move — use
-  `.venv/bin/python -m pip`, never `.venv/bin/pip`.
-- `local` backend: transformers must be <5 (pinned). Embedding batches are
-  token-budget packed (32k padded tokens); don't run two GPU ingests at
-  once on MPS.
+- A backend's index only covers projects ingested with that backend —
+  `stats` shows row counts per table.
+- `search` (freeform text query) is hashed-backend-only in the Rust binary;
+  model-backend text queries still need the Python CLI.
+- Duplicate function names across projects/units exist (e.g. REL `fn_1_*`);
+  pass `--project` to disambiguate which one you mean.
 - This file is canonical in the repo
   (`.claude/skills/decomp-search/SKILL.md`); `~/.claude/skills/decomp-search/SKILL.md`
   is a symlink to it.

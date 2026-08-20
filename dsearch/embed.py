@@ -177,3 +177,31 @@ def embed(token_docs: list[str], backend: str = "hashed",
 def default_backend() -> str:
     # local = self-hosted voyage-4-nano; DSEARCH_BACKEND overrides
     return os.environ.get("DSEARCH_BACKEND", "local")
+
+
+def embed_query(text: str, backend: str = "hashed") -> list[float]:
+    """Embed one ad-hoc query text (the `search` command). Documents use
+    document-mode embeddings; queries use query-mode where the backend
+    distinguishes them (voyage models are asymmetric)."""
+    if backend == "hashed":
+        return embed_hashed([text])[0]
+    if backend == "local":
+        global _local_model
+        from sentence_transformers import SentenceTransformer  # lazy
+
+        if _local_model is None:
+            _local_model = SentenceTransformer(
+                LOCAL_MODEL, trust_remote_code=True, truncate_dim=LOCAL_DIM)
+            _local_model.max_seq_length = 2048
+        emb = _local_model.encode_query([text[:8000]],
+                                        normalize_embeddings=True,
+                                        show_progress_bar=False)
+        return emb[0].tolist()
+    if backend == "voyage":
+        import voyageai  # lazy
+
+        client = voyageai.Client(api_key=os.environ["VOYAGE_API_KEY"])
+        res = client.embed([text[:16000]], model="voyage-4-nano",
+                           input_type="query", output_dimension=LOCAL_DIM)
+        return list(res.embeddings[0])
+    raise ValueError(f"unknown backend {backend!r}")
