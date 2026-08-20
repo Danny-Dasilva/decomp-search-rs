@@ -3,19 +3,18 @@
 [![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](rust/Cargo.toml)
 
-**Find the matched twin of any unmatched function — in 10 milliseconds.**
+**Find the matched twin of any unmatched function in 10 milliseconds.**
 
 decomp-search is a local similarity-search engine for matching
 decompilation projects (dtk-based GameCube/Wii and friends). Ingest a
-project's target assembly, and ask: *"this function won't match — show me
+project's target assembly, then ask: *"this function won't match; show me
 the most similar functions that already DO match, so I can steal their
 source recipe."* Donor transplanting is the highest-yield technique in
-agent-driven decomp campaigns; this tool makes the donor lookup effectively
-free.
+agent-driven decomp campaigns, and this tool makes the donor lookup
+effectively free.
 
-Think `ripgrep` energy, but the corpus is embedded PowerPC instruction
-streams and the query is a whole function — or any 32-instruction window
-of one.
+The corpus is embedded PowerPC instruction streams. The query is a whole
+function, or any 32-instruction window of one.
 
 ```console
 $ dsearch find getDoorGlobalPosition__Q34Game4Cave7MapNodeFi --all -k 5
@@ -32,20 +31,20 @@ real    0m0.011s
 
 ## Why decomp-search?
 
-- **It's fast.** A cold process answers whole-function queries in ~10 ms and
-  window (construct) queries in 30–90 ms — 80–141x faster than the previous
-  Python/LanceDB implementation, measured end-to-end (table below). No
-  server, no daemon, no warmup: mmap + OS page cache do the work.
-- **It's exact.** No ANN index, no recall knobs — every query is a full
-  SIMD cosine scan over the corpus. Results are rank-identical to the
-  reference implementation (verified over 160 sampled queries).
-- **It's built for agents.** `--json` everywhere (stable schema), a
-  one-call `donors` command (whole-function + construct twins together),
-  a built-in `--ladder` that relaxes the match-percentage filter
-  (99.5→99→95→90) instead of making the caller retry, `same_unit` flags on
+- **Fast.** A cold process answers whole-function queries in ~10 ms and
+  window (construct) queries in 30-90 ms, which is 80-141x faster than the
+  previous Python/LanceDB implementation measured end-to-end (table below).
+  There is no server or warmup step; mmap and the OS page cache do the work.
+- **Exact.** Every query is a full SIMD cosine scan over the corpus, with
+  no ANN index or recall knobs. Results are rank-identical to the reference
+  implementation (verified over 160 sampled queries).
+- **Built for agents.** `--json` everywhere with a stable schema, a
+  one-call `donors` command that returns whole-function and construct twins
+  together, a built-in `--ladder` that relaxes the match-percentage filter
+  (99.5, 99, 95, 90) so the caller never has to retry, `same_unit` flags on
   every hit, and output that never truncates a symbol name.
-- **Ingest is instant.** A full 16k-function project — objdump, normalize,
-  embed, index — takes ~0.5 s (hashed backend), and re-ingest is
+- **Instant ingest.** A full 16k-function project (objdump, normalize,
+  embed, index) takes ~0.5 s on the hashed backend. Re-ingest is
   incremental: unchanged functions reuse their stored vectors.
 
 ## Performance
@@ -60,18 +59,18 @@ the Python/LanceDB reference (44.6k functions, 209k windows, dim 512):
 | `findw`, 10-window fn | 3.8 s | **40 ms** | 97x |
 | `findw`, 42-window fn (p99) | 12.2 s | **86 ms** | 141x |
 | `donors` (find + findw combined) | 4.5 s | **47 ms** | 96x |
-| `ingest-dtk`, full project | minutes | **0.56 s** | — |
-| `sweep` (rank all open fns by best donor) | up to 1 h | **0.2 s** | — |
+| `ingest-dtk`, full project | minutes | **0.56 s** | n/a |
+| `sweep` (rank all open fns by best donor) | up to 1 h | **0.2 s** | n/a |
 
-Warm-process floor (server-style embedding of the library): `find` p50
-1.5 ms, `findw` p50 4.9 ms. Methodology and verification in
+Warm-process floor (embedding the library in a server): `find` p50 1.5 ms,
+`findw` p50 4.9 ms. Methodology and verification in
 [`bench/RESULTS.md`](bench/RESULTS.md); reproduce with
 `bench/run_bench.py` and `dsearch bench`.
 
 Where the old stack spent its time: 89% of every call was Python imports
 (445 ms of it an unused REST client), searches were unindexed flat scans
-through Arrow with a 10–50x overfetch, and window search ran one full scan
-*per query window*. The Rust engine mmaps vectors zero-copy, pushes filters
+through Arrow with a 10-50x overfetch, and window search ran one full scan
+per query window. The Rust engine mmaps vectors zero-copy, pushes filters
 into the scan, and answers all query windows in one memory pass.
 
 ## Install
@@ -81,7 +80,7 @@ into the scan, and answers all query windows in one memory pass.
 cargo install --git https://github.com/Danny-Dasilva/decomp-search-rs dsearch
 
 # or from a clone:
-cargo build --release          # → target/release/dsearch
+cargo build --release          # -> target/release/dsearch
 ```
 
 Then get an index (either path):
@@ -126,30 +125,30 @@ dsearch --json find <fn> -k 10
 ```
 
 JSON hits carry `name, unit, src_path, match_pct, n_insns, sim, same_unit`
-(+ `q_at`/`t_at` window offsets). `--ladder` relaxes `--min-match` down the
-99.5/99/95/90 ladder on zero hits and reports `min_match_used` — the retry
-loop agents used to hand-roll.
+(plus `q_at`/`t_at` window offsets). `--ladder` relaxes `--min-match` down
+the 99.5/99/95/90 ladder on zero hits and reports `min_match_used`. Agents
+used to hand-roll that retry loop.
 
 ## How it works
 
 - **Normalize**: each function's disassembly becomes a token stream that
   keeps structural signal (mnemonic skeleton, operand shapes, branch
-  *direction* — `b(back)` is a backedge) and drops what varies between
-  twins (registers, addresses, symbol names, literals).
+  direction: `b(back)` is a backedge) and drops what varies between twins
+  (registers, addresses, symbol names, literals).
 - **Embed**: `hashed` = BLAKE2b feature-hashed 1/2/3-grams, sublinear TF,
   512-dim, fully deterministic, embedded natively in Rust.
   `local`/`voyage` = [voyage-4-nano](https://huggingface.co/voyageai/voyage-4-nano)
-  document embeddings (Python sidecar at ingest only — queries never run a
-  model; `find`/`findw` search with stored vectors).
-- **Index** (`.dsi`): one mmap'd file per table — header, project/unit
+  document embeddings. The model runs only in the Python sidecar at ingest
+  time; `find`/`findw` search with stored vectors.
+- **Index** (`.dsi`): one mmap'd file per table: header, project/unit
   dictionaries, fixed 40-byte rows, a name-sorted permutation for
   binary-search lookup, string blob, then 64-byte-aligned L2-normalized
   f32 vectors. Zero-copy load; queries never touch token pages.
-- **Scan**: unit vectors make cosine a dot product; autovectorized
-  (AVX-512 where available) chunked scans with per-thread top-k heaps via
+- **Scan**: unit vectors make cosine a dot product. Chunked scans
+  autovectorize (AVX-512 where available) with per-thread top-k heaps via
   rayon. `findw` computes every query window against the corpus in a
-  single pass — extra windows are nearly free because the scan is
-  memory-bandwidth bound.
+  single pass; the scan is memory-bandwidth bound, so extra windows are
+  nearly free.
 
 ## Using it from Claude / agent harnesses
 
@@ -169,8 +168,8 @@ loop agents used to hand-roll.
   hashed-backend-only in Rust; model-backend text queries still go through
   the Python CLI.
 - Your corpus is millions of functions: the exact-scan design is sized for
-  the ~10⁵ range (where it's faster than an ANN index would be *and*
-  exact). Past that, you'd want quantization or ANN — neither is here yet.
+  the ~10^5 range, where it beats an ANN index on speed and is exact.
+  Past that you'd want quantization or ANN, and neither is here yet.
 - You need the struct-layout tooling (`types-*`): that subsystem is
   unchanged Python (`dsearch/typeidx.py`).
 
