@@ -1,161 +1,179 @@
 # decomp-search
 
-Local similarity search over decompilation-project functions. Ingest a
-project's target assembly (and match metadata), embed every function, and
-query for structurally similar functions — e.g. "given this unmatched
-function, show me the most similar **matched** functions so I can steal
-their source recipe."
+[![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
+[![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](rust/Cargo.toml)
 
-**The search engine is a Rust binary** (`rust/`) over a flat mmap'd index
-(`.dsi` files): zero-copy load, exact brute-force cosine over contiguous
-f32 vectors with a batched multi-query scan for window search. No server,
-no daemon — a cold process answers in ~10ms. The Python package (`dsearch/`)
-remains for the model-embedding sidecar (`local`/`voyage` backends), the
-type-layout index, and legacy compatibility.
+**Find the matched twin of any unmatched function — in 10 milliseconds.**
+
+decomp-search is a local similarity-search engine for matching
+decompilation projects (dtk-based GameCube/Wii and friends). Ingest a
+project's target assembly, and ask: *"this function won't match — show me
+the most similar functions that already DO match, so I can steal their
+source recipe."* Donor transplanting is the highest-yield technique in
+agent-driven decomp campaigns; this tool makes the donor lookup effectively
+free.
+
+Think `ripgrep` energy, but the corpus is embedded PowerPC instruction
+streams and the query is a whole function — or any 32-instruction window
+of one.
+
+```console
+$ dsearch find getDoorGlobalPosition__Q34Game4Cave7MapNodeFi --all -k 5
+similar to getDoorGlobalPosition__Q34Game4Cave7MapNodeFi (151 insns)
+   sim  match%  insns  function                                     unit
+ 0.977   100.0    115  createWayPoints__Q34Game10ItemBridge4ItemFv  obj/plugProjectKandoU/itemBridge.o
+ 0.974   100.0    131  moveNoTarget__Q34Game4Baby3ObjFv             obj/plugProjectNishimuraU/Baby.o
+ 0.973   100.0    314  createCrashEnemy__Q34Game10DangoMushi3ObjFv  obj/plugProjectNishimuraU/DangoMushi.o
+ 0.973   100.0    154  onSetPosition__Q34Game8ItemWeed4ItemFv       obj/plugProjectKandoU/itemWeed.o
+ 0.973   100.0    135  doSimulation__Q34Game13PanModokiBase3ObjFf   obj/plugProjectMorimuraU/panModoki.o
+
+real    0m0.011s
+```
+
+## Why decomp-search?
+
+- **It's fast.** A cold process answers whole-function queries in ~10 ms and
+  window (construct) queries in 30–90 ms — 80–141x faster than the previous
+  Python/LanceDB implementation, measured end-to-end (table below). No
+  server, no daemon, no warmup: mmap + OS page cache do the work.
+- **It's exact.** No ANN index, no recall knobs — every query is a full
+  SIMD cosine scan over the corpus. Results are rank-identical to the
+  reference implementation (verified over 160 sampled queries).
+- **It's built for agents.** `--json` everywhere (stable schema), a
+  one-call `donors` command (whole-function + construct twins together),
+  a built-in `--ladder` that relaxes the match-percentage filter
+  (99.5→99→95→90) instead of making the caller retry, `same_unit` flags on
+  every hit, and output that never truncates a symbol name.
+- **Ingest is instant.** A full 16k-function project — objdump, normalize,
+  embed, index — takes ~0.5 s (hashed backend), and re-ingest is
+  incremental: unchanged functions reuse their stored vectors.
 
 ## Performance
 
-End-to-end CLI (full process cost, as agents pay it), same index, same
-results (rank-parity verified over 160 sampled queries; ties may permute):
+End-to-end CLI, full process cost per call, same index and same results as
+the Python/LanceDB reference (44.6k functions, 209k windows, dim 512):
 
 | command | python (LanceDB) | rust | speedup |
 |---|---|---|---|
-| `find` (44.6k functions) | 853 ms | **9.6 ms** | 89x |
-| `findw`, 5-window fn (209k windows) | 2.4 s | **30 ms** | 80x |
+| `find` | 853 ms | **9.6 ms** | 89x |
+| `findw`, 5-window fn | 2.4 s | **30 ms** | 80x |
 | `findw`, 10-window fn | 3.8 s | **40 ms** | 97x |
 | `findw`, 42-window fn (p99) | 12.2 s | **86 ms** | 141x |
 | `donors` (find + findw combined) | 4.5 s | **47 ms** | 96x |
-| `ingest-dtk` melee, full (16.3k fns + 56k windows, hashed) | minutes | **0.56 s** | — |
+| `ingest-dtk`, full project | minutes | **0.56 s** | — |
+| `sweep` (rank all open fns by best donor) | up to 1 h | **0.2 s** | — |
 
-Why: the Python CLI spent 89% of its time importing (757 ms of which 445 ms
-is an unused REST client), searched with no ANN index (flat scan through
-Arrow), overfetched 10–50x for client-side filtering, and ran one scan *per
-query window*. The Rust engine mmaps vectors, pushes filters into the scan,
-and answers all query windows in one memory pass. In the melee agent logs,
-`findw` was called 18,913 times at median 7.5 s — ~50 h of cumulative agent
-wait this replaces with ~0.2 h.
+Warm-process floor (server-style embedding of the library): `find` p50
+1.5 ms, `findw` p50 4.9 ms. Methodology and verification in
+[`bench/RESULTS.md`](bench/RESULTS.md); reproduce with
+`bench/run_bench.py` and `dsearch bench`.
 
-## Setup
+Where the old stack spent its time: 89% of every call was Python imports
+(445 ms of it an unused REST client), searches were unindexed flat scans
+through Arrow with a 10–50x overfetch, and window search ran one full scan
+*per query window*. The Rust engine mmaps vectors zero-copy, pushes filters
+into the scan, and answers all query windows in one memory pass.
+
+## Install
 
 ```sh
-cd rust && cargo build --release        # binary: rust/target/release/dsearch
-# optional: cargo install --path rust   # puts `dsearch` on PATH
+# from git, one line (binary lands in ~/.cargo/bin):
+cargo install --git https://github.com/Danny-Dasilva/decomp-search-rs dsearch
+
+# or from a clone:
+cargo build --release          # → target/release/dsearch
 ```
 
-Index files live in `data/dsi/` (`--index-dir` / `DSEARCH_INDEX_DIR`).
-Backend selection: `--backend hashed|local|voyage` (default `local`,
-`DSEARCH_BACKEND` overrides) — each backend is its own index file, so they
-coexist for A/B comparison.
-
-- `hashed`: deterministic feature-hashed n-grams over a normalized
-  instruction-token stream (BLAKE2b, 512-dim). Embedded natively in Rust —
-  bit-exact with the Python implementation. No API, no model.
-- `local` (default): [voyage-4-nano](https://huggingface.co/voyageai/voyage-4-nano)
-  via sentence-transformers, MRL-truncated to 512 dims. Vectors are produced
-  by the Python sidecar at ingest time; queries never run the model.
-- `voyage`: same model via the Voyage API (`VOYAGE_API_KEY`).
-
-Normalization keeps the structural signal (mnemonic skeleton, operand
-shapes, **branch direction** — `b(back)` is a backedge) and discards what
-varies between twins (register numbers, addresses, symbol names).
-
-## Migrating an existing LanceDB index
+Then get an index (either path):
 
 ```sh
-.venv/bin/python tools/export_index.py --db data/index.lancedb --out /tmp/export
+# A) build one from your project's target objects (hashed backend, ~1 s):
+dsearch --backend hashed ingest-dtk <repo_root> --project <name> \
+    --version <VER> --windows \
+    --report 'https://decomp.dev/<org>/<repo>/<VER>.json?mode=report'
+
+# B) migrate an existing LanceDB index built by the Python implementation:
+python tools/export_index.py --db data/index.lancedb --out /tmp/export
 dsearch build-index --meta /tmp/export/functions_local.meta.jsonl \
-    --vectors /tmp/export/functions_local.vec.f32 --out data/dsi/functions_local.dsi
-# ... repeat per table (functions/windows × hashed/local)
+    --vectors /tmp/export/functions_local.vec.f32 \
+    --out data/dsi/functions_local.dsi        # repeat per table
 ```
 
-## Ingest a dtk-based project
+Indexes live in `data/dsi/` (`--index-dir` / `DSEARCH_INDEX_DIR`). Sanity
+check: `dsearch --backend hashed stats`.
 
-Needs the project's built target objects (`build/<VERSION>/obj/**/*.o`) and
-optionally a decomp.dev progress report:
-
-```sh
-dsearch --backend hashed ingest-dtk ~/etc/melee \
-    --project melee --version GALE01 --windows \
-    --report 'https://decomp.dev/doldecomp/melee/GALE01.json?mode=report'
-```
-
-Ingest is **incremental**: each function's token text is diffed against the
-stored row, so re-running only re-embeds new/changed functions
-(metadata-only changes like a moved match % reuse the stored vector).
-Hashed ingest of a full project is sub-second. For the `local` backend,
-new/changed docs are embedded through the Python sidecar: pass
-`--py .venv/bin/python` (or set `DSEARCH_PY`); unchanged rows never touch
-the model. Multiple games coexist in one index.
-
-## Query
+## Usage
 
 ```sh
-# one-call donor lookup for agents: whole-fn twins + window twins, JSON,
-# min-match fallback ladder (99.5→99→95→90) built in:
-dsearch donors lbHeap_80015900 --project melee -k 10 --wk 6
+# the twin-finder: matched donors for an unmatched function
+dsearch find <fn> --min-match 99.5 -k 10
 
-# top matched functions similar to an unmatched one (the twin-finder):
-dsearch find lbHeap_80015900 --min-match 99.5
+# one-call donor lookup for agents (whole-fn + window twins, JSON, ladder):
+dsearch donors <fn> --project <name> -k 10 --wk 6
 
-# unfiltered similarity (see the whole neighborhood):
-dsearch find mpRightWallGetTop --all
+# construct-level: match ANY 32-insn window of <fn> against the corpus
+dsearch --backend hashed findw <fn> -k 10
 
-# cross-TU only (drop trivial same-file siblings):
-dsearch find mpRightWallGetTop --exclude-self-unit
+# whole neighborhood, no match% filter / cross-TU only
+dsearch find <fn> --all
+dsearch find <fn> --exclude-self-unit
 
-# machine-readable (same schema as the old dsearch.jsonq):
-dsearch --json find lbHeap_80015900 -k 10
+# rank every open function by its best matched donor ("what's solvable?")
+dsearch --backend local sweep --project <name> --min-sim 0.85 > solvable.json
+
+# machine-readable anything
+dsearch --json find <fn> -k 10
 ```
 
 JSON hits carry `name, unit, src_path, match_pct, n_insns, sim, same_unit`
-(+ `q_at`/`t_at` for windows). `--ladder` relaxes `--min-match` down the
-99.5/99/95/90 ladder on zero hits and reports `min_match_used`.
+(+ `q_at`/`t_at` window offsets). `--ladder` relaxes `--min-match` down the
+99.5/99/95/90 ladder on zero hits and reports `min_match_used` — the retry
+loop agents used to hand-roll.
 
-## Construct-level (window) search
+## How it works
 
-`ingest-dtk --windows` also indexes sliding 32-insn windows (stride 16) of
-every function. `findw <fn>` then matches *any part* of the query function
-against *any part* of the corpus — this finds construct twins (a loop shape
-buried inside a larger matched function) that whole-function vectors
-provably miss:
+- **Normalize**: each function's disassembly becomes a token stream that
+  keeps structural signal (mnemonic skeleton, operand shapes, branch
+  *direction* — `b(back)` is a backedge) and drops what varies between
+  twins (registers, addresses, symbol names, literals).
+- **Embed**: `hashed` = BLAKE2b feature-hashed 1/2/3-grams, sublinear TF,
+  512-dim, fully deterministic, embedded natively in Rust.
+  `local`/`voyage` = [voyage-4-nano](https://huggingface.co/voyageai/voyage-4-nano)
+  document embeddings (Python sidecar at ingest only — queries never run a
+  model; `find`/`findw` search with stored vectors).
+- **Index** (`.dsi`): one mmap'd file per table — header, project/unit
+  dictionaries, fixed 40-byte rows, a name-sorted permutation for
+  binary-search lookup, string blob, then 64-byte-aligned L2-normalized
+  f32 vectors. Zero-copy load; queries never touch token pages.
+- **Scan**: unit vectors make cosine a dot product; autovectorized
+  (AVX-512 where available) chunked scans with per-thread top-k heaps via
+  rayon. `findw` computes every query window against the corpus in a
+  single pass — extra windows are nearly free because the scan is
+  memory-bandwidth bound.
 
-```sh
-dsearch --backend hashed findw lbHeap_80015900 -k 10
-# -> MakeColorGenTExp t@416: the 2x-unroll construct, invisible to `find`
-```
+## Using it from Claude / agent harnesses
 
-All query windows are answered in **one** batched scan over the corpus
-(memory-bandwidth bound, so extra windows are nearly free — 42 windows cost
-86 ms, not 42 × 30 ms).
+- [`CLAUDE.md`](CLAUDE.md) gives coding agents the project map,
+  invariants, and verification commands.
+- [`.claude/skills/decomp-search/SKILL.md`](.claude/skills/decomp-search/SKILL.md)
+  is the agent-facing usage skill (donor-transplant workflow, find vs
+  findw vs donors). Symlink it into `~/.claude/skills/decomp-search` to
+  enable it in Claude Code.
+- `--json` output is schema-compatible with the legacy `dsearch.jsonq`
+  module, so existing harness wrappers can swap the subprocess target and
+  keep their parsers.
 
-## Solvability sweep
+## When NOT to use it
 
-```sh
-dsearch --backend local sweep --project melee --min-sim 0.85 > solvable.json
-```
+- You want semantic free-text search over the corpus: `search` is
+  hashed-backend-only in Rust; model-backend text queries still go through
+  the Python CLI.
+- Your corpus is millions of functions: the exact-scan design is sized for
+  the ~10⁵ range (where it's faster than an ANN index would be *and*
+  exact). Past that, you'd want quantization or ANN — neither is here yet.
+- You need the struct-layout tooling (`types-*`): that subsystem is
+  unchanged Python (`dsearch/typeidx.py`).
 
-Every sub-100% function ranked by its best matched (≥ `--donor-min`)
-neighbor — the "probably solvable by donor" list. Same JSON as the old
-nightly `jsonq sweep`, but fast enough to re-run on demand.
+## License
 
-## Benchmarks & eval
-
-```sh
-dsearch bench --windows                      # internal latency percentiles
-.venv/bin/python bench/run_bench.py ...      # head-to-head vs Python (bench/RESULTS.md)
-dsearch --backend local eval                 # recall on eval/known_pairs.json
-```
-
-## Type-layout index
-
-The struct-layout subsystem (redundant structs, union views, cast scans) is
-unchanged Python — see `dsearch/typeidx.py` and the skill doc
-(`.claude/skills/decomp-search/SKILL.md`).
-
-## Index format (`.dsi`)
-
-One mmap'd file per table: header, project/unit dictionaries, fixed 40-byte
-row records, a name-sorted permutation (binary-search lookup), string blob
-(names + token docs — token pages are never touched by queries), then
-64-byte-aligned L2-normalized f32 vectors. Load cost is a mmap + header
-parse; the OS page cache keeps vectors hot between calls.
+MIT or Apache-2.0, at your option.

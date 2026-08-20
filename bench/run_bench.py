@@ -20,12 +20,8 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_RUST = HERE.parent / "rust/target/release/dsearch"
 DEFAULT_DSI = HERE.parent / "data/dsi"
 
-# queries chosen to span sizes: (name, n_windows_hint)
-QUERIES = [
-    "lbHeap_80015900",   # 174 insns, 10 windows
-    "mpRightWallGetTop", # ~5 windows
-    "OSInit",            # 42 windows (p99-ish window count)
-]
+# override with --queries; pick names spanning small/median/p99 window counts
+DEFAULT_QUERIES = ["lbHeap_80015900", "mpRightWallGetTop", "OSInit"]
 
 
 def timeit(cmd, iters, warmup=2, cwd=None):
@@ -54,12 +50,16 @@ def main():
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--rust", default=str(DEFAULT_RUST))
     ap.add_argument("--dsi", default=str(DEFAULT_DSI))
-    ap.add_argument("--py", default="/home/danny/Documents/personal/decomp-search/.venv/bin/python")
+    ap.add_argument("--py", default=".venv/bin/python",
+                    help="python with the dsearch package + lancedb")
+    ap.add_argument("--queries", nargs="*", default=DEFAULT_QUERIES,
+                    help="function names to benchmark")
     ap.add_argument("--pydir", required=True, help="dir containing a working dsearch package")
     ap.add_argument("--db", required=True, help="LanceDB index path")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
+    Q = args.queries
     rows = []
 
     def bench(label, pycmd, rscmd):
@@ -76,22 +76,22 @@ def main():
 
     for backend in ("hashed", "local"):
         bench(
-            f"find {QUERIES[0]} ({backend})",
-            py_base + ["--backend", backend, "find", QUERIES[0], "--project", "", "-k", "10"],
-            rs_base + ["--backend", backend, "find", QUERIES[0], "-k", "10"],
+            f"find {Q[0]} ({backend})",
+            py_base + ["--backend", backend, "find", Q[0], "--project", "", "-k", "10"],
+            rs_base + ["--backend", backend, "find", Q[0], "-k", "10"],
         )
-    for q in QUERIES:
+    for q in Q:
         bench(
             f"findw {q} (local)",
             py_base + ["--backend", "local", "findw", q, "--project", "", "-k", "10"],
             rs_base + ["--backend", "local", "findw", q, "-k", "10"],
         )
-    # donors: python = two subprocess calls (find local + findw hashed), as the
-    # melee-loop wrapper does; rust = one process
-    label = f"donors {QUERIES[0]} (find local + findw hashed)"
-    pt1, e1 = timeit(py_base + ["--backend", "local", "find", QUERIES[0], "--project", "", "-k", "10"], args.iters, cwd=args.pydir)
-    pt2, e2 = timeit(py_base + ["--backend", "hashed", "findw", QUERIES[0], "--project", "", "-k", "6"], args.iters, cwd=args.pydir)
-    rt, rerr = timeit([args.rust, "--index-dir", args.dsi, "--backend", "local", "donors", QUERIES[0], "-k", "10", "--wk", "6"], args.iters)
+    # donors: python = two subprocess calls (find local + findw hashed), as
+    # agent harnesses issue them; rust = one process
+    label = f"donors {Q[0]} (find local + findw hashed)"
+    pt1, e1 = timeit(py_base + ["--backend", "local", "find", Q[0], "--project", "", "-k", "10"], args.iters, cwd=args.pydir)
+    pt2, e2 = timeit(py_base + ["--backend", "hashed", "findw", Q[0], "--project", "", "-k", "6"], args.iters, cwd=args.pydir)
+    rt, rerr = timeit([args.rust, "--index-dir", args.dsi, "--backend", "local", "donors", Q[0], "-k", "10", "--wk", "6"], args.iters)
     if pt1 and pt2 and rt:
         combined = [a + b for a, b in zip(pt1, pt2)]
         pm, rm = statistics.median(combined), statistics.median(rt)

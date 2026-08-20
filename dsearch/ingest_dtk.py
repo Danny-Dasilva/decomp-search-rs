@@ -102,7 +102,7 @@ def iter_units(project_root: Path, version: str) -> Iterator[tuple[Path, str]]:
 
 
 def find_source_file(project_root: Path, unit: str) -> str | None:
-    """Best-effort map from unit name (e.g. melee/mp/mplib.o) to a source path."""
+    """Best-effort map from unit name (e.g. game/mp/mplib.o) to a source path."""
     stem = unit.removesuffix(".o")
     for base in ("src", "source", ""):
         for ext in (".c", ".cpp"):

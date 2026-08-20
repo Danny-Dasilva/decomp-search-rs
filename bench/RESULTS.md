@@ -17,16 +17,16 @@ iters=8, warm page cache, full process cost per call
 |---|---|
 | find p50 / p90 / p99 (44.6k fns) | 1.47 / 2.02 / 2.58 ms |
 | findw p50 / p90 / max (209k windows) | 4.9 / 45.7 / 48.1 ms |
-| ingest-dtk melee full (16.3k fns + 56k windows, hashed) | 0.56 s |
+| ingest-dtk full project (16.3k fns + 56k windows, hashed) | 0.56 s |
 | ingest-dtk re-run, no changes (all vectors reused) | 0.71 s |
-| sweep --project melee (solvability, whole corpus) | 0.20 s |
+| sweep (solvability, whole 16k-fn project) | 0.20 s |
 
 Baseline (Python/LanceDB, same index, warm cache): find 867 ms end-to-end
-(769 ms = imports), findw 3.6–12.2 s; production agent logs: findw median
+(769 ms = imports), findw 3.6–12.2 s; production decomp-agent logs: findw median
 7.5 s, p99 61.6 s across 18,913 calls.
 
 Hardware: Threadripper 7970X 32C/64T, AVX-512, 183 GiB RAM. Rank-parity
 vs Python verified on 160 sampled queries (ties permute); hashed embedding
-bit-exact (self-sim 1.0); melee ingest token docs byte-identical on
+bit-exact (self-sim 1.0); ingest token docs byte-identical on
 15,978/15,979 common functions (1 diff = repo drift since index snapshot);
 eval recall 7/8, identical to Python (miss = documented findw-only case).

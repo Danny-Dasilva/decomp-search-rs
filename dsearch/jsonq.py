@@ -1,11 +1,11 @@
-"""JSON query interface for harness integration (melee-loop skill).
+"""JSON query interface for agent-harness integration.
 
 Prints machine-readable results so callers don't parse rich tables.
 
-  python -m dsearch.jsonq find FN [--project melee] [--backend local]
+  python -m dsearch.jsonq find FN [--project NAME] [--backend local]
          [--min-match 99.5] [-k 10] [--all] [--exclude-self-unit]
   python -m dsearch.jsonq findw FN [...same...]
-  python -m dsearch.jsonq sweep [--project melee] [--backend local]
+  python -m dsearch.jsonq sweep [--project NAME] [--backend local]
          [--max-match 99.999] [--min-insns 8] [--donor-min 99.5] [-k 20]
 
 `sweep` is the solvability sweep: every sub-`max-match` function ranked by its
@@ -148,14 +148,14 @@ def main():
     for name, fn in (("find", cmd_find), ("findw", cmd_findw)):
         sp = sub.add_parser(name)
         sp.add_argument("function")
-        sp.add_argument("--project", default="melee")
+        sp.add_argument("--project", default=None)
         sp.add_argument("--min-match", type=float, default=99.5)
         sp.add_argument("--all", action="store_true")
         sp.add_argument("-k", type=int, default=10)
         sp.add_argument("--exclude-self-unit", action="store_true")
         sp.set_defaults(func=fn)
     ss = sub.add_parser("sweep")
-    ss.add_argument("--project", default="melee")
+    ss.add_argument("--project", default=None)
     ss.add_argument("--max-match", type=float, default=99.999)
     ss.add_argument("--min-insns", type=int, default=8)
     ss.add_argument("--donor-min", type=float, default=99.5)

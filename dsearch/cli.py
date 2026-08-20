@@ -333,7 +333,7 @@ def cmd_types_ingest(args) -> None:
     ctx = Path(args.ctx) if args.ctx else Path(args.root) / "build" / "ctx.c"
     if not ctx.exists():
         raise SystemExit(f"{ctx} not found — generate it with m2ctx "
-                         f"(melee: .venv/bin/python tools/m2ctx/m2ctx.py -p)")
+                         f"(generate with your project's m2ctx: python tools/m2ctx/m2ctx.py -p)")
     idx = typeidx.ingest(args.project, ctx, clang=args.clang)
     n = len(idx["records"])
     console.print(f"[green]{args.project}: {n} records indexed from "
