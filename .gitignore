@@ -1,4 +1,5 @@
-.venv/
 data/
+rust/target/
+dsearch.egg-info/
 __pycache__/
-*.pyc
+.venv/
